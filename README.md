@@ -1,10 +1,10 @@
 # airflow-pipeline-templates
 
-Production-grade Apache Airflow DAGs built for Amazon MWAA — based on real data engineering work in healthcare and enterprise environments.
+Production-grade Apache Airflow DAGs built for Amazon MWAA — based on real data engineering work in healthcare and enterprise environments using Databricks, AWS, and Delta Lake.
 
 ## Overview
 
-This repository contains battle-tested Airflow DAG templates used to orchestrate complex multi-step data pipelines on AWS. Each DAG reflects real production patterns — not tutorials.
+This repository contains battle-tested Airflow DAG templates used to orchestrate complex multi-step data pipelines on AWS. Each DAG reflects real production patterns — not tutorials. The underlying data transformation layer is built on **Databricks with Delta Lake**, orchestrated end-to-end by Apache Airflow on Amazon MWAA.
 
 ---
 
@@ -13,7 +13,7 @@ This repository contains battle-tested Airflow DAG templates used to orchestrate
 ### 1. `healthcare_etl_pipeline.py`
 **End-to-end healthcare claims pipeline**
 
-Orchestrates a full Medallion Architecture pipeline:
+Orchestrates a full Medallion Architecture pipeline built on Databricks:
 - Triggers AWS Glue ingestion job (Bronze layer)
 - Validates S3 output with S3KeySensor
 - Spins up EMR cluster and submits PySpark steps (Silver + Gold layers)
@@ -21,22 +21,19 @@ Orchestrates a full Medallion Architecture pipeline:
 - Terminates EMR cluster after processing
 - Loads Gold layer into Snowflake via COPY INTO
 - Sends success/failure alerts via Amazon SNS
-
-```
 check_source_data
-    ├── no_data_skip (graceful exit if no data)
-    └── trigger_glue_ingestion
-            └── validate_bronze_s3
-                    └── create_emr_cluster
-                            └── submit_emr_steps
-                                    ├── wait_bronze_to_silver
-                                    └── wait_silver_to_gold
-                                            └── validate_row_counts
-                                                    └── terminate_emr_cluster
-                                                            └── load_snowflake
-                                                                    └── validate_snowflake_load
-                                                                            └── notify_success
-```
+├── no_data_skip (graceful exit if no data)
+└── trigger_glue_ingestion
+└── validate_bronze_s3
+└── create_emr_cluster
+└── submit_emr_steps
+├── wait_bronze_to_silver
+└── wait_silver_to_gold
+└── validate_row_counts
+└── terminate_emr_cluster
+└── load_snowflake
+└── validate_snowflake_load
+└── notify_success
 
 **Schedule:** Daily at 02:00 UTC
 **SLA:** Must complete within 4 hours
@@ -67,23 +64,27 @@ Captures real-time changes from source databases via AWS DMS and loads into Amaz
 
 | Tool | Purpose |
 |---|---|
+| **Databricks** | Data lake processing, Delta Lake management, PySpark transformations |
+| **Delta Lake** | ACID-compliant storage — enables time-travel, schema evolution, MERGE operations |
 | Apache Airflow 2.x | Pipeline orchestration |
 | Amazon MWAA | Managed Airflow environment |
-| AWS Glue | Serverless ETL |
-| AWS EMR | Distributed PySpark processing |
+| AWS Glue | Serverless ETL — Bronze layer ingestion |
+| AWS EMR | Distributed PySpark processing — Silver and Gold layers |
 | Amazon S3 | Data lake storage |
 | Amazon Redshift | Cloud data warehouse |
-| Snowflake | Analytics warehouse |
+| Snowflake | Analytics warehouse — Gold layer consumption |
 | AWS DMS | Change Data Capture |
 | Amazon SNS | Alerting and notifications |
-| Delta Lake | ACID-compliant S3 storage |
 
 ---
 
 ## Key Patterns Used
 
-**Medallion Architecture (Bronze/Silver/Gold)**
-Each layer enforces progressively stricter data quality rules before data moves forward.
+**Medallion Architecture (Bronze/Silver/Gold) on Databricks**
+Built on Databricks using Delta Lake — each layer enforces progressively stricter data quality rules before data moves forward. Bronze lands raw data, Silver applies PySpark-based validation and deduplication, Gold produces star-schema aggregations for BI consumption.
+
+**Delta Lake MERGE for late-arriving data**
+Uses Delta MERGE operations to handle upserts cleanly — late-arriving records are handled without reprocessing entire partitions. Delta time-travel enables fast rollback during incidents without touching source systems.
 
 **Branch Operator for Data Availability Checks**
 Pipelines check for source data before starting — gracefully skipping runs with no new data rather than failing.
@@ -127,5 +128,6 @@ Uses `TriggerRule.ONE_FAILED` to ensure failure notifications fire even if only 
 ## Author
 
 **Premchand Kothapalli**
-Data Engineer | AWS | PySpark | Airflow | Snowflake
+Data Engineer | AWS | Databricks | PySpark | Airflow | Snowflake
 [LinkedIn](https://linkedin.com/in/pc-kothapalli) | premchandkdata@gmail.com
+[GitHub](https://github.com/premchand2001)
