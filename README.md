@@ -1,105 +1,116 @@
 # airflow-pipeline-templates
 
-Production-grade Apache Airflow DAGs built for Amazon MWAA — based on real data engineering work in healthcare and enterprise environments using Databricks, AWS, and Delta Lake.
+Production-grade Apache Airflow DAGs for Amazon MWAA — orchestrating complex multi-step data pipelines across AWS Glue, EMR, Redshift, and Snowflake. Built from real healthcare and enterprise data engineering work at **Optum (UnitedHealth Group)** and **HGS**.
 
-## Overview
-
-This repository contains battle-tested Airflow DAG templates used to orchestrate complex multi-step data pipelines on AWS. Each DAG reflects real production patterns — not tutorials. The underlying data transformation layer is built on **Databricks with Delta Lake**, orchestrated end-to-end by Apache Airflow on Amazon MWAA.
+These aren't tutorial DAGs. They handle real production concerns: data availability checks before processing starts, DQ gate failures that halt pipelines before bad data reaches downstream consumers, EMR cost control via sensor reschedule mode, and schema drift alerts that fire before a silent corruption reaches anyone.
 
 ---
 
 ## DAGs
 
-### 1. `healthcare_etl_pipeline.py`
-**End-to-end healthcare claims pipeline**
+| File | Pipeline | Schedule |
+|---|---|---|
+| `healthcare_etl_pipeline.py` | Full Medallion Architecture — Glue → EMR → Snowflake | Daily 02:00 UTC |
+| `cdc_incremental_ingestion.py` | CDC-based incremental ingestion — DMS → Glue → Redshift | Every 4 hours |
 
-Orchestrates a full Medallion Architecture pipeline built on Databricks:
-- Triggers AWS Glue ingestion job (Bronze layer)
-- Validates S3 output with S3KeySensor
-- Spins up EMR cluster and submits PySpark steps (Silver + Gold layers)
-- Validates row counts between layers
-- Terminates EMR cluster after processing
-- Loads Gold layer into Snowflake via COPY INTO
-- Sends success/failure alerts via Amazon SNS
+---
+
+## DAG 1 — `healthcare_etl_pipeline.py`
+
+End-to-end Medallion Architecture pipeline orchestrating Bronze ingestion through Silver transformation to Gold Snowflake load.
+
+### Task Flow
+
+```
 check_source_data
-├── no_data_skip (graceful exit if no data)
+├── no_data_skip          ← BranchPythonOperator: graceful exit if no new files
 └── trigger_glue_ingestion
-└── validate_bronze_s3
-└── create_emr_cluster
-└── submit_emr_steps
-├── wait_bronze_to_silver
-└── wait_silver_to_gold
-└── validate_row_counts
-└── terminate_emr_cluster
-└── load_snowflake
-└── validate_snowflake_load
-└── notify_success
+        └── validate_bronze_s3        ← S3KeySensor (mode=poke)
+                └── create_emr_cluster
+                        └── submit_emr_steps
+                                ├── wait_bronze_to_silver   ← EmrStepSensor (mode=reschedule)
+                                └── wait_silver_to_gold     ← EmrStepSensor (mode=reschedule)
+                                        └── validate_row_counts
+                                                └── terminate_emr_cluster
+                                                        └── load_snowflake
+                                                                └── validate_snowflake_load
+                                                                        └── notify_success
+```
 
-**Schedule:** Daily at 02:00 UTC
-**SLA:** Must complete within 4 hours
-**Retries:** 2 retries with 15-minute delay
+**On any failure:** `TriggerRule.ONE_FAILED` fires `notify_failure` — alert fires even if only one upstream task fails.
 
----
+### Key Design Decisions
 
-### 2. `cdc_incremental_ingestion.py`
-**CDC-based incremental ingestion pipeline**
+**Branch on data availability**
+Checks for new source files before spinning up EMR. No new data = graceful skip, not a pipeline failure. Prevents unnecessary EMR cluster costs and noisy failure alerts on quiet days.
 
-Captures real-time changes from source databases via AWS DMS and loads into Amazon Redshift:
-- Checks DMS replication task health before proceeding
-- Detects schema drift and alerts via SNS
-- Processes CDC files from S3 using AWS Glue
-- Runs automated data quality checks:
-  - Row count validation vs previous run
-  - Null rate checks on critical columns
-  - Duplicate detection on primary keys
-- Merges staging data into production using UPSERT pattern
-- Publishes data quality alerts if thresholds are breached
+**EMR sensors in `reschedule` mode**
+`EmrStepSensor` uses `mode="reschedule"` — releases the Airflow worker slot while waiting for long-running Spark jobs. In MWAA with limited worker concurrency, blocking sensors starve other DAGs.
 
-**Schedule:** Every 4 hours
-**Retries:** 3 retries with 10-minute delay
+**Row count validation before Snowflake load**
+Silver → Gold row counts are compared before the Snowflake load step proceeds. A row count drop of > 5% halts the pipeline and alerts — catches upstream truncation before it silently empties the warehouse.
 
----
+**EMR cluster terminated on every run**
+No persistent cluster. Cluster is created per run and terminated after Gold step completes — even on failure (cleanup task with `TriggerRule.ALL_DONE`). Eliminates idle EMR cost.
 
-## Tech Stack
+### DAG Config
 
-| Tool | Purpose |
+| Parameter | Value |
 |---|---|
-| **Databricks** | Data lake processing, Delta Lake management, PySpark transformations |
-| **Delta Lake** | ACID-compliant storage — enables time-travel, schema evolution, MERGE operations |
-| Apache Airflow 2.x | Pipeline orchestration |
-| Amazon MWAA | Managed Airflow environment |
-| AWS Glue | Serverless ETL — Bronze layer ingestion |
-| AWS EMR | Distributed PySpark processing — Silver and Gold layers |
-| Amazon S3 | Data lake storage |
-| Amazon Redshift | Cloud data warehouse |
-| Snowflake | Analytics warehouse — Gold layer consumption |
-| AWS DMS | Change Data Capture |
-| Amazon SNS | Alerting and notifications |
+| Schedule | `0 2 * * *` (Daily 02:00 UTC) |
+| SLA | 4 hours |
+| Retries | 2 retries, 15-minute delay |
+| Catchup | False |
+| Alerting | SNS on success and failure |
 
 ---
 
-## Key Patterns Used
+## DAG 2 — `cdc_incremental_ingestion.py`
 
-**Medallion Architecture (Bronze/Silver/Gold) on Databricks**
-Built on Databricks using Delta Lake — each layer enforces progressively stricter data quality rules before data moves forward. Bronze lands raw data, Silver applies PySpark-based validation and deduplication, Gold produces star-schema aggregations for BI consumption.
+CDC-based incremental ingestion pipeline. Captures row-level changes from source databases via AWS DMS and merges them into production Redshift tables using an UPSERT pattern.
 
-**Delta Lake MERGE for late-arriving data**
-Uses Delta MERGE operations to handle upserts cleanly — late-arriving records are handled without reprocessing entire partitions. Delta time-travel enables fast rollback during incidents without touching source systems.
+### Task Flow
 
-**Branch Operator for Data Availability Checks**
-Pipelines check for source data before starting — gracefully skipping runs with no new data rather than failing.
+```
+check_dms_task_health
+        └── detect_schema_drift        ← alerts via SNS if columns changed
+                └── trigger_glue_cdc_processing
+                        └── run_dq_checks
+                                ├── validate_row_count_delta
+                                ├── check_null_rates
+                                └── detect_duplicate_keys
+                                        └── merge_staging_to_production   ← UPSERT
+                                                └── publish_dq_summary
+                                                        └── notify_success / notify_failure
+```
 
-**EMR Sensor with reschedule mode**
-Uses `mode="reschedule"` on EMR step sensors to avoid blocking worker slots during long-running Spark jobs.
+### Key Design Decisions
 
-**UPSERT pattern in Redshift**
-CDC merges use a DELETE + INSERT pattern rather than UPDATE to work efficiently with Redshift's columnar storage.
+**DMS health check before processing**
+Verifies the DMS replication task is in `running` state before touching any CDC files. A stalled DMS task produces incomplete S3 output — processing it without checking produces silent partial loads.
 
-**Schema Drift Detection**
-Every run compares the current table schema against an expected schema definition and alerts immediately if columns change.
+**Schema drift detection before Glue runs**
+Compares current source schema against the expected schema definition stored in config. Fires an SNS alert immediately if any column was added, dropped, or renamed. Glue processing is halted until the schema definition is reviewed and updated — prevents silent downstream corruption.
 
-**SNS Alerting on both success and failure**
-Uses `TriggerRule.ONE_FAILED` to ensure failure notifications fire even if only one task in the chain fails.
+**UPSERT via DELETE + INSERT on Redshift**
+Redshift doesn't support true `MERGE`. The CDC merge uses a staging table pattern:
+1. Load CDC batch into a temp staging table
+2. `DELETE` matching primary keys from production
+3. `INSERT` all rows from staging
+
+More efficient than `UPDATE` on Redshift's columnar storage — avoids row-level updates that fragment blocks.
+
+**DQ gate before merge**
+All three DQ checks (row count delta, null rates, duplicate keys) must pass before the merge step runs. A failure in any check halts the pipeline at the DQ stage — bad CDC batches never reach production tables.
+
+### DAG Config
+
+| Parameter | Value |
+|---|---|
+| Schedule | `0 */4 * * *` (Every 4 hours) |
+| Retries | 3 retries, 10-minute delay |
+| Catchup | False |
+| Alerting | SNS on DQ failure and on successful merge |
 
 ---
 
@@ -107,9 +118,9 @@ Uses `TriggerRule.ONE_FAILED` to ensure failure notifications fire even if only 
 
 | Variable | Description |
 |---|---|
-| `environment` | prod / staging / dev |
+| `environment` | `prod` / `staging` / `dev` |
 | `s3_data_lake_bucket` | S3 bucket for data lake |
-| `glue_iam_role` | IAM role for Glue jobs |
+| `glue_iam_role` | IAM role ARN for Glue jobs |
 | `sns_alert_topic_arn` | SNS topic for pipeline alerts |
 | `dms_replication_task_arn` | ARN of DMS CDC replication task |
 
@@ -125,9 +136,14 @@ Uses `TriggerRule.ONE_FAILED` to ensure failure notifications fire even if only 
 
 ---
 
+## Based On
+
+Real production work at **Optum (UnitedHealth Group)** (Oct 2021 – Dec 2023) and **HGS** (Nov 2019 – Sep 2021) — orchestrating healthcare and enterprise data pipelines across AWS Glue, EMR, Redshift, and Snowflake, processing 10M+ daily healthcare records.
+
+---
+
 ## Author
 
 **Premchand Kothapalli**
-Data Engineer | AWS | Databricks | PySpark | Airflow | Snowflake
-[LinkedIn](https://linkedin.com/in/pc-kothapalli) | premchandkdata@gmail.com
-[GitHub](https://github.com/premchand2001)
+Senior AI / ML Engineer | AWS · Azure AI Foundry · LangGraph · PySpark
+[LinkedIn](https://linkedin.com/in/pc-kothapalli) · premchandkdata@gmail.com · [GitHub](https://github.com/premchand2001)
