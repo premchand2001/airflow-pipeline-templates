@@ -133,17 +133,3 @@ All three DQ checks (row count delta, null rates, duplicate keys) must pass befo
 | `aws_default` | Amazon Web Services |
 | `snowflake_prod` | Snowflake |
 | `redshift_prod` | Amazon Redshift |
-
----
-
-## Based On
-
-Real production work at **Optum (UnitedHealth Group)** (Oct 2021 – Dec 2023) and **HGS** (Nov 2019 – Sep 2021) — orchestrating healthcare and enterprise data pipelines across AWS Glue, EMR, Redshift, and Snowflake, processing 10M+ daily healthcare records.
-
----
-
-## Author
-
-**Premchand Kothapalli**
-Senior AI / ML Engineer | AWS · Azure AI Foundry · LangGraph · PySpark
-[LinkedIn](https://linkedin.com/in/pc-kothapalli) · premchandkdata@gmail.com · [GitHub](https://github.com/premchand2001)
